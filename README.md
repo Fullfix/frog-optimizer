@@ -30,6 +30,8 @@ These design choices are motivated by the following observations:
 
 - Explicit construction of the activation covariance X^T X is prohibitively expensive for convolutional layers due to kernel expansion.
 
+- The output-side Fisher factor Y^T Y typically exhibits strong diagonal dominance compared to the input-side factor X^T X, making it effective to precondition rows (output channels) independently without huge loss in performance.
+
 - Exact inversion of X^T X tends to amplify noise in low-eigenvalue directions; iterative solvers implicitly regularize these directions.
 
 ## TODO
