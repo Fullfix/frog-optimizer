@@ -39,3 +39,4 @@ These design choices are motivated by the following observations:
 - Add support for linear layers.
 - Explore alternative activation subsampling strategies, including maintaining a pool of samples across optimization steps.
 - Compare FROG with other optimizers on convolutional architectures.
+- Add mixed precision support
