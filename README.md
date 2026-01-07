@@ -36,7 +36,8 @@ These design choices are motivated by the following observations:
 
 ## TODO
 
-- Add support for linear layers.
+- Add support for linear layers and biases.
+- Decouple epsilons for left and right side.
 - Explore alternative activation subsampling strategies, including maintaining a pool of samples across optimization steps.
 - Compare FROG with other optimizers on convolutional architectures.
 - Add mixed precision support
