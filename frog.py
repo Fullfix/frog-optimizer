@@ -119,10 +119,11 @@ class Frog(torch.optim.Optimizer):
             lr: float = 1e-3,
             momentum: float = 0.0,
             nesterov: bool = False,
-            stat_count: int = 256,
+            sample_size: int | None = 256,
             num_iters: int = 4,
             batch_averaged: bool = True,
             skip_modules: list[str] = None,
+            y_sample_size: int | None = None,
             eps: float = 1e-6
     ):
         """
@@ -132,17 +133,18 @@ class Frog(torch.optim.Optimizer):
           - Conv2d only (Linear not supported yet)
           - Row-wise output scaling using diag of YY^T
           - Iterative solve for input-side factor via batched CG in conv-weight space
-          - Random subsampling of batch statistics (stat_count)
+          - Random subsampling of batch statistics (sample_size and y_sample_size)
 
         :param params: Optimized parameters
         :param model: PyTorch model (required for hooks)
         :param lr: Learning rate for both preconditioned and unconditioned modules
         :param momentum: Momentum (same as in SGD)
         :param nesterov: Nesterov momentum (same as in SGD)
-        :param stat_count: Number of activations to subsample for iterative CG
+        :param sample_size: Number of activations to subsample for iterative CG. None means keep all activations
         :param num_iters: Number of CG iterations
         :param batch_averaged: Whether loss has reduction="mean" (for rescaling)
         :param skip_modules: Names of modules to skip
+        :param y_sample_size: Number of grad-outputs to average across for diagonal scaling. None means across all (recommended)
         :param eps: epsilon for both CG and grad_output sqrt
         """
 
@@ -152,10 +154,12 @@ class Frog(torch.optim.Optimizer):
             raise ValueError(f"Invalid momentum value: {momentum}")
         if nesterov and momentum <= 0.0:
             raise ValueError("Nesterov requires momentum > 0.")
-        if stat_count <= 0:
-            raise ValueError(f"stat_count must be positive, got {stat_count}")
+        if sample_size is not None and sample_size <= 0:
+            raise ValueError(f"sample_size must be None or positive, got {sample_size}")
         if num_iters <= 0:
             raise ValueError(f"num_iters must be positive, got {num_iters}")
+        if y_sample_size is not None and y_sample_size <= 0:
+            raise ValueError(f"y_sample_size must be None or positive, got {y_sample_size}")
         if eps < 0:
             raise ValueError(f"Invalid epsilon value: {eps}")
 
@@ -165,7 +169,8 @@ class Frog(torch.optim.Optimizer):
             nesterov=nesterov,
             eps=eps,
             num_iters=num_iters,
-            stat_count=stat_count,
+            sample_size=sample_size,
+            y_sample_size=y_sample_size,
             batch_averaged=batch_averaged
         )
         super().__init__(params, defaults)
@@ -218,7 +223,8 @@ class Frog(torch.optim.Optimizer):
             nesterov = group['nesterov']
             eps = group['eps']
             num_iters = group['num_iters']
-            stat_count = group['stat_count']
+            sample_size = group['sample_size']
+            y_sample_size = group['y_sample_size']
             batch_averaged = group['batch_averaged']
 
             for p in group["params"]:
@@ -252,13 +258,16 @@ class Frog(torch.optim.Optimizer):
                     module = self.param_to_module[p]
 
                     # Subsampling
-                    if stat_count < X_all.shape[0]:
-                        idx = torch.multinomial(torch.ones(X_all.shape[0], device=X_all.device), stat_count, replacement=False)
-
+                    if sample_size is not None and sample_size < X_all.shape[0]:
+                        idx = torch.multinomial(torch.ones(X_all.shape[0], device=X_all.device), sample_size, replacement=False)
                         X = X_all[idx]
-                        Y = Y_all[idx]
                     else:
                         X = X_all
+
+                    if y_sample_size is not None and y_sample_size < Y_all.shape[0]:
+                        idx = torch.multinomial(torch.ones(Y_all.shape[0], device=Y_all.device), y_sample_size, replacement=False)
+                        Y = Y_all[idx]
+                    else:
                         Y = Y_all
 
                     B = X.shape[0]
