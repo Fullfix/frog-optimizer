@@ -119,6 +119,7 @@ class Frog(torch.optim.Optimizer):
             lr: float = 1e-3,
             momentum: float = 0.0,
             nesterov: bool = False,
+            y_momentum: float = 0.0,
             sample_size: int | None = 256,
             num_iters: int = 4,
             batch_averaged: bool = True,
@@ -140,6 +141,7 @@ class Frog(torch.optim.Optimizer):
         :param lr: Learning rate for both preconditioned and unconditioned modules
         :param momentum: Momentum (same as in SGD)
         :param nesterov: Nesterov momentum (same as in SGD)
+        :param y_momentum: Momentum for grad-output scaling (same as in Adam)
         :param sample_size: Number of activations to subsample for iterative CG. None means keep all activations
         :param num_iters: Number of CG iterations
         :param batch_averaged: Whether loss has reduction="mean" (for rescaling)
@@ -154,6 +156,8 @@ class Frog(torch.optim.Optimizer):
             raise ValueError(f"Invalid momentum value: {momentum}")
         if nesterov and momentum <= 0.0:
             raise ValueError("Nesterov requires momentum > 0.")
+        if y_momentum < 0.0:
+            raise ValueError(f"Invalid y_momentum value: {y_momentum}")
         if sample_size is not None and sample_size <= 0:
             raise ValueError(f"sample_size must be None or positive, got {sample_size}")
         if num_iters <= 0:
@@ -167,6 +171,7 @@ class Frog(torch.optim.Optimizer):
             lr=lr,
             momentum=momentum,
             nesterov=nesterov,
+            y_momentum=y_momentum,
             eps=eps,
             num_iters=num_iters,
             sample_size=sample_size,
@@ -221,6 +226,7 @@ class Frog(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             nesterov = group['nesterov']
+            y_momentum = group['y_momentum']
             eps = group['eps']
             num_iters = group['num_iters']
             sample_size = group['sample_size']
@@ -240,6 +246,8 @@ class Frog(torch.optim.Optimizer):
                     state["step"] = 0
                     if momentum > 0.0:
                         state["momentum_buffer"] = torch.zeros_like(p)
+                    if y_momentum > 0.0 and (p in self.in_acts and p in self.out_grads):
+                        state['y_momentum_buffer'] = torch.zeros(p.shape[0], device=p.device, dtype=p.dtype)
 
                 state["step"] += 1
 
@@ -282,8 +290,16 @@ class Frog(torch.optim.Optimizer):
                         else:
                             y_diag.div_(B)
 
+                        if y_momentum > 0.0:
+                            y_buf = state['y_momentum_buffer']
+                            y_buf.mul_(y_momentum).add_(y_diag, alpha=1-y_momentum)
+                            bias_correction = 1 - y_momentum ** state['step']
+                            y_eff = y_buf / bias_correction
+                        else:
+                            y_eff = y_diag
+
                         # Left preconditioning
-                        P1 = eff_grad / (y_diag + eps).sqrt_().view(-1, 1, 1, 1)
+                        P1 = eff_grad / (y_eff + eps).sqrt_().view(-1, 1, 1, 1)
 
                         # Batched CG
                         P2, _ = batched_cg_conv(
