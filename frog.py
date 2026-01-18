@@ -4,111 +4,69 @@ from torch.nn import grad as nn_grad
 
 
 @torch.no_grad()
-def _batched_cg(
-        matmul: Callable[[torch.Tensor], torch.Tensor],
-        rhs: torch.Tensor,
-        num_iters: int,
-        denom_eps: float = 1e-10,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def batched_cg_conv(X_act, Y2_scaled, G, module: torch.nn.Conv2d, num_iters: int, eps=1e-6, denom_eps=1e-10):
     """
-    Solve A X = rhs for multiple RHS columns using batched Conjugate Gradient,
-    where A is given implicitly via matmul(V) = A @ V.
+    Solve (X_act^T @ Y2_scaled @ X_act + eps * I)W = G for every output channel (row-wise) using CG.
+    """
 
-    rhs: (n, m)
-    """
-    X = torch.zeros_like(rhs)
-    R = rhs.clone()
+    W = torch.zeros_like(G)
+    R = G.clone()
     P = R.clone()
 
-    rsold = (R * R).sum(dim=0)
+    rsold = (R * R).sum(dim=(1, 2, 3), keepdim=True)
 
     for _ in range(num_iters):
-        Ap = matmul(P)
-        pAp = (P * Ap).sum(dim=0)
-        alpha = rsold / (pAp + denom_eps)
-        alpha2d = alpha.view(1, -1)
+        XP = torch.nn.functional.conv2d(
+            X_act, P,
+            stride=module.stride,
+            padding=module.padding,
+            dilation=module.dilation,
+            groups=module.groups,
+        )
+        XP.mul_(Y2_scaled)
+        Ap = nn_grad.conv2d_weight(
+            X_act, P.shape, XP,
+            stride=module.stride,
+            padding=module.padding,
+            dilation=module.dilation,
+            groups=module.groups,
+        )
+        Ap.add_(P, alpha=eps)
 
-        X.addcmul_(P, alpha2d)
-        R.addcmul_(Ap, -alpha2d)
+        pAp = (P * Ap).sum(dim=(1, 2, 3), keepdim=True)
+        alpha = rsold / pAp.add_(denom_eps)
 
-        rsnew = (R * R).sum(dim=0)
-        beta = rsnew / (rsold + denom_eps)
-        P.mul_(beta.view(1, -1)).add_(R)
+        W.addcmul_(P, alpha)
+        R.addcmul_(Ap, alpha, value=-1.0)
+
+        rsnew = (R * R).sum(dim=(1, 2, 3), keepdim=True)
+        beta = rsnew / rsold.add_(denom_eps)
+
+        P.mul_(beta).add_(R)
         rsold = rsnew
 
-    residuals = torch.sqrt(rsold)
-    return X, residuals
+    return W
 
 
 @torch.no_grad()
-def batched_cg_conv(X, G, module: torch.nn.Conv2d, num_iters: int, eps=1e-6):
+def fisher_normalized_trace(X, Y2dB, module, ones):
     """
-    Solve ( (X^T X)/B + eps*I ) W = G implicitly in conv-weight space.
+    Compute normalized trace of row-wise Fisher matrices.
     """
+    assert module.groups == 1, "FROG currently only supports groups=1"
 
-    if module.groups != 1:
-        raise NotImplementedError("batched_cg_conv currently supports groups=1 only.")
-
-    C_out, C_in, kh, kw = G.shape
-    B, _, H, W = X.shape
-
-    def matmul(V: torch.Tensor) -> torch.Tensor:
-        v_kernels = V.transpose(0, 1).reshape(C_out, C_in, kh, kw)
-        XV = torch.nn.functional.conv2d(X, v_kernels, stride=module.stride, padding=module.padding, dilation=module.dilation, groups=module.groups)
-        FV = nn_grad.conv2d_weight(X, v_kernels.shape, XV, stride=module.stride, padding=module.padding, dilation=module.dilation, groups=module.groups)
-        AV = FV.reshape(C_out, -1).transpose(0, 1)
-        AV.div_(B)
-        AV.add_(V, alpha=eps)
-        return AV
-
-    G_flat = G.reshape(C_out, -1).transpose(0, 1)
-    X_flat, residuals = _batched_cg(matmul, G_flat, num_iters=num_iters)
-    X_solution = X_flat.transpose(0, 1).reshape(C_out, C_in, kh, kw)
-    return X_solution, residuals
-
-
-@torch.no_grad()
-def act_diag_conv(
-        X: torch.Tensor,
-        module: torch.nn.Conv2d
-) -> torch.Tensor:
-    """
-    Compute diagonal (per-input-channel, per-kernel-entry) activation covariance:
-      diag( (X^T X)/B ) in conv patch space.
-    """
-
-    if module.groups != 1:
-        raise NotImplementedError("act_diag_conv currently supports groups=1 only.")
-
-    B, C, H, W = X.shape
-    kh, kw = module.kernel_size
-    sh, sw = module.stride
-    ph, pw = module.padding
-    dh, dw = module.dilation
-    H_out = (H + 2 * ph - dh * (kh - 1) - 1) // sh + 1
-    W_out = (W + 2 * pw - dw * (kw - 1) - 1) // sw + 1
-
-    if H_out <= 0 or W_out <= 0:
-        raise ValueError(f"Invalid conv output size: H_out={H_out}, W_out={W_out} for input {(H, W)}")
-
-    grad_out = torch.ones(
-        (B, 1, H_out, W_out),
-        device=X.device,
-        dtype=X.dtype,
-    )
-
-    F = nn_grad.conv2d_weight(
-        X * X,
-        weight_size=(1, C, kh, kw),
-        grad_output=grad_out,
+    c_out, c_in, kh, kw = module.weight.shape
+    x2_sum = torch.linalg.vecdot(X, X, dim=1)
+    window_sum = torch.nn.functional.conv2d(
+        x2_sum.unsqueeze(1),
+        ones,
         stride=module.stride,
         padding=module.padding,
-        dilation=module.dilation,
-        groups=module.groups
-    ).squeeze(0)
-
-    F.div_(B)
-    return F
+        dilation=module.dilation
+    )
+    scalar = (Y2dB * window_sum).sum(dim=(0, 2, 3))
+    normalization = c_in * kh * kw
+    return scalar.div_(normalization)
 
 
 class Frog(torch.optim.Optimizer):
@@ -117,73 +75,76 @@ class Frog(torch.optim.Optimizer):
             params: Iterable[torch.Tensor],
             model: torch.nn.Module,
             lr: float = 1e-3,
+            lr_other_ratio: float = 0.25,
             momentum: float = 0.0,
             nesterov: bool = False,
-            y_momentum: float = 0.0,
-            sample_size: int | None = 256,
+            weight_decay: float = 0.0,
+            sample_size: int | None = 24,
             num_iters: int = 4,
+            tau: float = 1e-6,
             batch_averaged: bool = True,
             skip_modules: list[str] = None,
-            y_sample_size: int | None = None,
-            eps: float = 1e-6
+            denom_eps: float = 1e-10
     ):
         """
         FROG: Fisher ROw-wise PreconditioninG.
 
         Current implementation:
           - Conv2d only (Linear not supported yet)
-          - Row-wise output scaling using diag of YY^T
-          - Iterative solve for input-side factor via batched CG in conv-weight space
-          - Random subsampling of batch statistics (sample_size and y_sample_size)
+          - Iterative solve for row-wise empirical Fisher matrices using batched CG.
+          - Random subsampling of activations (X and Y)
 
         :param params: Optimized parameters
         :param model: PyTorch model (required for hooks)
-        :param lr: Learning rate for both preconditioned and unconditioned modules
+        :param lr: Learning rate for preconditioned modules
+        :param lr_other_ratio: Ratio for learning rate of other modules (lr_other = lr * lr_other_ratio)
         :param momentum: Momentum (same as in SGD)
         :param nesterov: Nesterov momentum (same as in SGD)
-        :param y_momentum: Momentum for grad-output scaling (same as in Adam)
-        :param sample_size: Number of activations to subsample for iterative CG. None means keep all activations
+        :param weight_decay: Weight decay (same as in SGD)
+        :param sample_size: Number of activations to subsample for iterative CG. None means keep all activations (not recommended).
         :param num_iters: Number of CG iterations
+        :param tau: Fisher damping factor: damping = tr(F)/D * tau
         :param batch_averaged: Whether loss has reduction="mean" (for rescaling)
         :param skip_modules: Names of modules to skip
-        :param y_sample_size: Number of grad-outputs to average across for diagonal scaling. None means across all (recommended)
-        :param eps: epsilon for both CG and grad_output sqrt
+        :param denom_eps: denominator epsilon for numerical stability
         """
-
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
+        if lr_other_ratio < 0.0:
+            raise ValueError(f"Invalid lr_other_ratio: {lr_other_ratio}")
         if momentum < 0.0:
             raise ValueError(f"Invalid momentum value: {momentum}")
         if nesterov and momentum <= 0.0:
             raise ValueError("Nesterov requires momentum > 0.")
-        if y_momentum < 0.0:
-            raise ValueError(f"Invalid y_momentum value: {y_momentum}")
         if sample_size is not None and sample_size <= 0:
             raise ValueError(f"sample_size must be None or positive, got {sample_size}")
         if num_iters <= 0:
             raise ValueError(f"num_iters must be positive, got {num_iters}")
-        if y_sample_size is not None and y_sample_size <= 0:
-            raise ValueError(f"y_sample_size must be None or positive, got {y_sample_size}")
-        if eps < 0:
-            raise ValueError(f"Invalid epsilon value: {eps}")
+        if tau < 0:
+            raise ValueError(f"Invalid tau value: {tau}")
+        if denom_eps < 0:
+            raise ValueError(f"Invalid denominator epsilon value: {denom_eps}")
 
         defaults = dict(
             lr=lr,
+            lr_other_ratio=lr_other_ratio,
             momentum=momentum,
             nesterov=nesterov,
-            y_momentum=y_momentum,
-            eps=eps,
-            num_iters=num_iters,
+            weight_decay=weight_decay,
             sample_size=sample_size,
-            y_sample_size=y_sample_size,
-            batch_averaged=batch_averaged
+            num_iters=num_iters,
+            tau=tau,
+            batch_averaged=batch_averaged,
+            denom_eps=denom_eps
         )
         super().__init__(params, defaults)
 
-        self.out_grads: dict[torch.Tensor, torch.Tensor] = {}
-        self.in_acts: dict[torch.Tensor, torch.Tensor] = {}
+        self.sample_indices: dict[torch.nn.Module, torch.Tensor] = {}
+        self.out_grads: dict[torch.nn.Module, torch.Tensor] = {}
+        self.in_acts: dict[torch.nn.Module, torch.Tensor] = {}
         self.param_to_module: dict[torch.Tensor, torch.nn.Module] = {}
         self.hooks: list[torch.utils.hooks.RemovableHandle] = []
+        self._ones_buffer = {}
 
         skip_modules = skip_modules or []
 
@@ -195,25 +156,56 @@ class Frog(torch.optim.Optimizer):
                     self.hooks.extend([h_fwd, h_bwd])
                     self.param_to_module[module.weight] = module
 
+    def _get_ones(self, kh, kw, device, dtype):
+        key = (kh, kw, device, dtype)
+        if key not in self._ones_buffer:
+            self._ones_buffer[key] = torch.ones((1, 1, kh, kw), device=device, dtype=dtype)
+        return self._ones_buffer[key]
+
     def _save_input(self, module: torch.nn.Module, input, output):
         if not torch.is_grad_enabled():
             return
         if len(input) == 0:
             return
 
-        X = input[0]
+        with torch.no_grad():
+            X_all = input[0]
 
-        if isinstance(module, torch.nn.Conv2d):
-            self.in_acts[module.weight] = X.detach()
+            if isinstance(module, torch.nn.Conv2d):
+                B_all = X_all.shape[0]
+                sample_size = self.defaults['sample_size']
+                if sample_size is not None and sample_size < B_all:
+                    idx = torch.randperm(X_all.shape[0], device=X_all.device)[:sample_size]
+                    self.sample_indices[module] = idx
+                    self.in_acts[module] = X_all[idx].detach()
+                else:
+                    self.in_acts[module] = X_all.detach().clone()
 
     def _save_grad_outputs(self, module: torch.nn.Module, grad_input, grad_output):
         if not grad_output or grad_output[0] is None:
             return
 
-        Y = grad_output[0]
+        with torch.no_grad():
+            Y_all = grad_output[0]
 
-        if isinstance(module, torch.nn.Conv2d):
-            self.out_grads[module.weight] = Y.detach()
+            if isinstance(module, torch.nn.Conv2d):
+                if module in self.sample_indices:
+                    idx = self.sample_indices.pop(module)
+                    Y = Y_all[idx].detach()
+                else:
+                    Y = Y_all.detach().clone()
+
+                B_all = Y_all.shape[0]
+                B = Y.shape[0]
+
+                if self.defaults['batch_averaged']:
+                    scale = (B_all * B_all) / B
+                    Y2dB = Y.square_().mul_(scale)
+                else:
+                    Y2dB = Y.square_().div_(B)
+
+                self.out_grads[module] = Y2dB
+
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -224,20 +216,21 @@ class Frog(torch.optim.Optimizer):
 
         for group in self.param_groups:
             lr = group["lr"]
+            lr_other_ratio = group['lr_other_ratio']
             momentum = group["momentum"]
             nesterov = group['nesterov']
-            y_momentum = group['y_momentum']
-            eps = group['eps']
-            num_iters = group['num_iters']
+            weight_decay = group['weight_decay']
             sample_size = group['sample_size']
-            y_sample_size = group['y_sample_size']
+            num_iters = group['num_iters']
+            tau = group['tau']
             batch_averaged = group['batch_averaged']
+            denom_eps = group['denom_eps']
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 if p.grad.is_sparse:
-                    raise RuntimeError("AWPFull does not support sparse gradients")
+                    raise RuntimeError("Frog does not support sparse gradients")
 
                 grad = p.grad
 
@@ -246,8 +239,6 @@ class Frog(torch.optim.Optimizer):
                     state["step"] = 0
                     if momentum > 0.0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    if y_momentum > 0.0 and (p in self.in_acts and p in self.out_grads):
-                        state['y_momentum_buffer'] = torch.zeros(p.shape[0], device=p.device, dtype=p.dtype)
 
                 state["step"] += 1
 
@@ -258,70 +249,46 @@ class Frog(torch.optim.Optimizer):
                 else:
                     eff_grad = grad
 
-                # Preconditioning
-                if p in self.in_acts and p in self.out_grads:
-                    X_all = self.in_acts[p]
-                    Y_all = self.out_grads[p]
-
+                if p in self.param_to_module:
                     module = self.param_to_module[p]
 
-                    # Subsampling
-                    if sample_size is not None and sample_size < X_all.shape[0]:
-                        idx = torch.multinomial(torch.ones(X_all.shape[0], device=X_all.device), sample_size, replacement=False)
-                        X = X_all[idx]
-                    else:
-                        X = X_all
-
-                    if y_sample_size is not None and y_sample_size < Y_all.shape[0]:
-                        idx = torch.multinomial(torch.ones(Y_all.shape[0], device=Y_all.device), y_sample_size, replacement=False)
-                        Y = Y_all[idx]
-                    else:
-                        Y = Y_all
-
-                    B = X.shape[0]
-
                     if isinstance(module, torch.nn.Linear):
-                        raise NotImplementedError('Linear layers not yet supported')
+                        raise Exception("Linear not supported yet")
                     elif isinstance(module, torch.nn.Conv2d):
-                        y_diag = (Y ** 2).sum(dim=(0, 2, 3))  # C_out
-                        # Rescaling
-                        if batch_averaged:
-                            y_diag.mul_(B)
-                        else:
-                            y_diag.div_(B)
+                        X = self.in_acts[module]
+                        Y2dB = self.out_grads[module]
 
-                        if y_momentum > 0.0:
-                            y_buf = state['y_momentum_buffer']
-                            y_buf.mul_(y_momentum).add_(y_diag, alpha=1-y_momentum)
-                            bias_correction = 1 - y_momentum ** state['step']
-                            y_eff = y_buf / bias_correction
-                        else:
-                            y_eff = y_diag
+                        F_tr = fisher_normalized_trace(X, Y2dB, module, ones=self._get_ones(p.shape[-2], p.shape[-1], X.device, X.dtype))
+                        Y2_scaled = Y2dB.div_(F_tr.add_(denom_eps).view(1, -1, 1, 1))
 
-                        # Left preconditioning
-                        P1 = eff_grad / (y_eff + eps).sqrt_().view(-1, 1, 1, 1)
-
-                        # Batched CG
-                        P2, _ = batched_cg_conv(
-                            X, P1,
+                        # Solve row-wise (F/F_tr + tau * I)W = G using CG
+                        P1 = batched_cg_conv(
+                            X, Y2_scaled, eff_grad,
                             module=module,
                             num_iters=num_iters,
-                            eps=eps
+                            eps=tau,
+                            denom_eps=denom_eps
                         )
 
-                        # Post diagonal scaling to imitate -1/2
-                        x_scaling = torch.sqrt(act_diag_conv(X, module=module))  # C_in x kh x kw
-                        direction = P2.mul_(x_scaling.unsqueeze(0)).view_as(p)
+                        # Normalization
+                        P1_dot = (P1 * eff_grad).sum(dim=(1, 2, 3))
+                        scalar = P1_dot.add_(denom_eps).rsqrt_()
+
+                        if weight_decay > 0.0:
+                            p.mul_(1 - lr * weight_decay)
+                        p.addcmul_(P1, scalar.view(-1, 1, 1, 1), value=-lr)
                     else:
                         raise ValueError(f"Invalid module: {module}")
                 else:
                     direction = eff_grad
-
-                p.add_(direction, alpha=-lr)
+                    if weight_decay > 0.0:
+                        direction.add_(p, alpha=weight_decay)
+                    p.add_(direction, alpha=-lr * lr_other_ratio)
 
         # Clear references
         self.in_acts.clear()
         self.out_grads.clear()
+        self.sample_indices.clear()
         return loss
 
     def close(self):
