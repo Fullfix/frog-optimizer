@@ -33,6 +33,7 @@ This optimizer is motivated by the following observations:
 
 All experiments were conducted on NVIDIA A100 (80 GB) using the CIFAR-10 dataset and the ResNet-18 model.  
 Reported values correspond to wall-clock time (in minutes) required to first reach a given test accuracy.
+A reference reproduction notebook is provided at `experiments/exp-cifar10.ipynb`.
 
 The learning-rate schedule follows the setup from  
 https://github.com/hirotomusiker/cifar10_pytorch/:  
