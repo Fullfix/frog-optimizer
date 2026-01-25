@@ -1,32 +1,44 @@
 # FROG Optimizer
 
-FROG (Fisher ROw-wise preconditioninG) is a K-FAC inspired optimizer with several structural modifications aimed at making second-order preconditioning practical and stable.
+**FROG (Fisher ROw-wise preconditioninG)** is a second-order optimizer that approximates natural-gradient updates using row-wise Fisher preconditioning and batched Conjugate Gradient (CG) solves. 
+It is inspired by K-FAC, but avoids Kronecker factorization and instead approximates the Fisher matrix as row-wise block-diagonal, using a small subset of samples to obtain stable, scale-free updates with low computational overhead.
+
+A detailed technical description of the method is provided in **`technical_overview.pdf`**.
 
 ## Motivation
 
-This optimizer is motivated by the following observations:
+FROG is motivated by the following observations:
 
-- Scale-invariance is a desirable property for the optimizer, as in Adam or RMSProp. Newtonian methods are not scale invariant and have scale as inverse gradient.
+- Scale-invariance is a desirable optimizer property, as in Adam or RMSProp.  
+  Classical Newton and natural-gradient methods are not scale-invariant and are sensitive to gradient magnitude.
 
-- At the later stages of training, decoupling X and Y seems to hurt performance.
+- At later stages of training, decoupling input and output factors (X and Y), as done in K-FAC, often degrades performance.
 
-- Y^T Y typically exhibits strong diagonal dominance. This suggests that Fisher may be close to block-diagonal w.r.t rows, making it effective to precondition rows (output channels) independently without huge loss in performance.
+- The empirical Fisher term \( Y^\top Y \) is typically strongly diagonally dominant, suggesting that cross-row correlations are weak and that row-wise preconditioning is a reasonable approximation.
 
-- Exact empirical Fisher construction is prohibitively expensive. So, subsampling and batched CG is used.
+- Exact empirical Fisher construction is prohibitively expensive; therefore subsampling and iterative solvers are required in practice.
 
+## Method Overview
 
-## Key modifications
+FROG approximates normalized natural-gradient updates by solving a **row-wise Fisher system** for each output row (or convolutional channel).  
+Each row’s Fisher matrix is estimated from a small subset of activations and inverted approximately using a small number of batched CG iterations.
 
-- No decoupling of Fisher into kronecker product, as in K-FAC.
+To stabilize learning and remove sensitivity to loss scaling, the Fisher matrix is normalized by its average diagonal value `tr(F) / D` and damped.  
+Momentum is applied before Fisher preconditioning, and weight decay is handled in a decoupled manner.
 
-- Row-wise separation: each row has its own Fisher matrix.
+## Key Modifications (relative to K-FAC)
 
-- Rescaling Fisher by tr(F)/D (average diagonal value) to achieve scale-invariance.   
+- **No Kronecker factorization** of the Fisher matrix.
 
-- Iterative CG on row-wise Fishers
+- **Row-wise Fisher separation**: each output row (or channel) is preconditioned independently.
 
-- Subsampled activations
-  Fisher matvecs are computed using a random subset of activations, significantly reducing computational cost.
+- **Trace-normalized Fisher** `F / (tr(F) / D)` for scale-free updates.
+
+- **Iterative Conjugate Gradient** instead of explicit matrix inversion.
+
+- **Subsampled activations** for Fisher estimation, significantly reducing computational cost.
+
+For full details, algorithmic description, and practical guidelines, see **`technical_overview.pdf`**.
 
 
 ## Wall-clock Efficiency (CIFAR-10)
